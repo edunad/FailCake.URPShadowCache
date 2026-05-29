@@ -1,0 +1,19 @@
+{
+    "name": "FailCake.URPShadowCache.Editor",
+    "rootNamespace": "FailCake",
+    "references": [
+        "GUID:e4537b38c0f6ca94fa2b253830d6be1f",
+        "GUID:15fc0a57446b3144c949da3e2b9737a9"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

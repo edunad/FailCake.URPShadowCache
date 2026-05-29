@@ -1,0 +1,23 @@
+{
+  "name": "com.failcake.urp.shadowcache",
+  "displayName": "FailCake URP Shadow Cache",
+  "version": "0.1.0",
+  "unity": "6000.0",
+  "description": "Shadow caching for URP spot & point lights. Forward+ only",
+  "type": "library",
+  "keywords": [
+    "shadow",
+    "cache",
+    "light",
+    "urp",
+    "rendering",
+    "forward+"
+  ],
+  "dependencies": {
+    "com.unity.render-pipelines.universal": "17.0.0"
+  },
+  "author": {
+    "name": "FailCake",
+    "url": "https://github.com/edunad/FailCake.URPShadowCache"
+  }
+}
