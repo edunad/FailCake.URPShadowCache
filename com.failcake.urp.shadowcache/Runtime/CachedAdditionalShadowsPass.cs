@@ -158,7 +158,7 @@ namespace FailCake
             passData.softShadows = this._softShadows;
             passData.softShadowQuality = this._softShadowQuality;
 
-            builder.UseTexture(this._mainHandle);
+            builder.UseTexture(this._mainHandle, AccessFlags.Read);
             builder.AllowPassCulling(false);
             builder.AllowGlobalStateModification(true);
             builder.SetGlobalTextureAfterPass(this._mainHandle, CachedAdditionalShadowsPass._idAdditionalLightsShadowmapTexture);
@@ -476,7 +476,10 @@ namespace FailCake
                             fs.listStatic = renderGraph.CreateShadowRendererList(ref ss);
                         }
 
-                        ShadowDrawingSettings sd = this.MakeSettings(cullResults, fs.visibleLightIndex, ShadowObjectsFilter.DynamicOnly, useLayers);
+  
+                        ShadowDrawingSettings sd = fs.hasBakeCull
+                            ? this.MakeSettings(fs.bakeCull, fs.bakeLightIndex, ShadowObjectsFilter.DynamicOnly, useLayers)
+                            : this.MakeSettings(cullResults, fs.visibleLightIndex, ShadowObjectsFilter.DynamicOnly, useLayers);
                         fs.listDynamic = renderGraph.CreateShadowRendererList(ref sd);
                         break;
                     }
@@ -505,7 +508,7 @@ namespace FailCake
                 if (fs is { category: SliceCategory.CACHED_DYNAMIC, staticDirty: true } && fs.listStatic.IsValid()) builder.UseRendererList(fs.listStatic);
             }
 
-            builder.SetRenderAttachmentDepth(staticHandle);
+            builder.SetRenderAttachmentDepth(staticHandle, AccessFlags.ReadWrite);
             builder.AllowPassCulling(false);
             builder.AllowGlobalStateModification(true);
             builder.SetRenderFunc<BakePassData>(CachedAdditionalShadowsPass.ExecuteStaticBake);
@@ -537,8 +540,8 @@ namespace FailCake
                 }
             }
 
-            if (anyDynamic) builder.UseTexture(staticHandle);
-            builder.SetRenderAttachmentDepth(mainHandle);
+            if (anyDynamic) builder.UseTexture(staticHandle, AccessFlags.Read);
+            builder.SetRenderAttachmentDepth(mainHandle, AccessFlags.ReadWrite);
             builder.AllowPassCulling(false);
             builder.AllowGlobalStateModification(true);
             builder.SetRenderFunc<MainPassData>(CachedAdditionalShadowsPass.ExecuteMain);
