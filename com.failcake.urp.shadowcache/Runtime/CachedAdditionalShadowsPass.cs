@@ -22,7 +22,7 @@ namespace FailCake
 
         #region STATIC
 
-        private const int SHADOWMAP_BITS = 16;
+        private const int SHADOWMAP_BITS = 32;
 
         private const int BLIT_PASS_COPY = 0;
         private const int BLIT_PASS_CLEAR = 1;
@@ -56,12 +56,11 @@ namespace FailCake
         private RTHandle _staticAtlas;
         private int _allocatedAtlasSize;
 
-        private readonly Dictionary<int, Slot> _slots = new Dictionary<int, Slot>();
-        private readonly Dictionary<int, Stack<Vector2Int>> _freeByResolution = new Dictionary<int, Stack<Vector2Int>>();
+        private int _atlasSize;
+        private bool _atlasDirty;
 
-        private int _cursorX;
-        private int _cursorY;
-        private int _rowHeight;
+        private readonly Dictionary<int, Slot> _slots = new Dictionary<int, Slot>();
+        private readonly Dictionary<int, HashSet<Vector2Int>> _freeBlocks = new Dictionary<int, HashSet<Vector2Int>>();
 
         private readonly List<FrameSlice> _frameSlices = new List<FrameSlice>();
 
@@ -107,6 +106,8 @@ namespace FailCake
 
             if (shadowData.resolution == null || shadowData.bias == null) return;
 
+            this.SyncPacker();
+
             int validSlices = this.BuildFrameSlices(ref renderingData.cullResults, cameraData, lightData, shadowData);
             if (validSlices == 0) return;
 
@@ -133,8 +134,9 @@ namespace FailCake
                 }
             }
 
-            if (anyStaticBake) this.RecordStaticBakePass(renderGraph, staticHandle);
+            if (anyStaticBake || (this._atlasDirty && anyDynamic)) this.RecordStaticBakePass(renderGraph, staticHandle);
             this.RecordMainPass(renderGraph, this._mainHandle, staticHandle, anyDynamic);
+            this._atlasDirty = false;
 
             this._atlasSizeV2 = new Vector2Int(this._allocatedAtlasSize, this._allocatedAtlasSize);
 
@@ -171,12 +173,13 @@ namespace FailCake
             this._mainAtlas = null;
             this._staticAtlas = null;
             this._allocatedAtlasSize = 0;
+            this._atlasSize = 0;
 
             if (this._blitMaterial) CoreUtils.Destroy(this._blitMaterial);
             this._blitMaterial = null;
 
             this._slots.Clear();
-            this._freeByResolution.Clear();
+            this._freeBlocks.Clear();
         }
 
         #region SETUP
@@ -198,6 +201,9 @@ namespace FailCake
             bool supportsSoftShadows = shadowData.supportsSoftShadows;
             bool anySoft = false;
 
+            Vector3 camPos = cameraData.worldSpaceCameraPos;
+            float maxShadowDistance = cameraData.maxShadowDistance;
+
             NativeArray<VisibleLight> visibleLights = lightData.visibleLights;
             int additionalLightIndex = -1;
 
@@ -216,6 +222,11 @@ namespace FailCake
 
                 if (lightType != LightType.Spot && lightType != LightType.Point) continue;
                 if (light.shadows == LightShadows.None || light.shadowStrength <= 0f) continue;
+
+                Vector3 lightPosition = visibleLight.localToWorldMatrix.GetColumn(3);
+
+                float fadeDistance = maxShadowDistance + light.range;
+                if ((lightPosition - camPos).sqrMagnitude > fadeDistance * fadeDistance) continue;
 
                 EntityId lightId = light.GetEntityId();
                 CachedShadowLight cache = this._feature.GetCache(lightId);
@@ -247,68 +258,110 @@ namespace FailCake
                 int desiredResolution = this.ResolutionFor(category, cache, shadowData, visibleLightIndex);
 
                 bool needsStaticBake = category != SliceCategory.REALTIME && hasBakeCull && this._feature.NeedsStaticBake(lightId);
+                bool cachedSlot = category != SliceCategory.REALTIME;
+
+                int allocRes = desiredResolution;
+                if (this._slots.TryGetValue(lightId.GetHashCode() * 6, out Slot pinned) && pinned.requestedResolution == desiredResolution) allocRes = pinned.resolution;
 
                 int perLightFirstSlice = -1;
                 bool addedAny = false;
 
-                for (int face = 0; face < perLightSlices; face++)
+                while (true)
                 {
-                    if (this._frameSlices.Count >= this._maxSlices) break;
+                    perLightFirstSlice = -1;
+                    addedAny = false;
 
-                    int sliceKey = lightId.GetHashCode() * 6 + face;
-                    if (!this.TryGetOrAllocSlot(sliceKey, lightId, desiredResolution, frame, out Slot slot)) break;
+                    int firstLightSlice = this._frameSlices.Count;
+                    bool aborted = false;
+                    bool atlasFull = false;
 
-                    bool ok;
-
-                    Matrix4x4 shadowTransform;
-                    Matrix4x4 view;
-                    Matrix4x4 proj;
-
-                    if (lightType == LightType.Spot)
-                        ok = ShadowUtils.ExtractSpotLightMatrix(ref cullResults, shadowData, visibleLightIndex, out shadowTransform, out view, out proj, out ShadowSplitData _);
-                    else
+                    for (int face = 0; face < perLightSlices; face++)
                     {
-                        float fovBias = CachedAdditionalShadowsPass.PointLightFovBias(slot.resolution, light.shadows == LightShadows.Soft);
-                        ok = ShadowUtils.ExtractPointLightMatrix(ref cullResults, shadowData, visibleLightIndex, (CubemapFace)face, fovBias, out shadowTransform, out view, out proj, out ShadowSplitData _);
+                        if (this._frameSlices.Count >= this._maxSlices)
+                        {
+                            aborted = true;
+                            break;
+                        }
+
+                        int sliceKey = lightId.GetHashCode() * 6 + face;
+                        if (!this.TryGetOrAllocSlot(sliceKey, lightId, desiredResolution, allocRes, cachedSlot, frame, out Slot slot, out bool fresh))
+                        {
+                            aborted = true;
+                            atlasFull = true;
+                            break;
+                        }
+
+                        bool ok;
+
+                        Matrix4x4 shadowTransform;
+                        Matrix4x4 view;
+                        Matrix4x4 proj;
+
+                        if (lightType == LightType.Spot)
+                            ok = ShadowUtils.ExtractSpotLightMatrix(ref cullResults, shadowData, visibleLightIndex, out shadowTransform, out view, out proj, out ShadowSplitData _);
+                        else
+                        {
+                            float fovBias = CachedAdditionalShadowsPass.PointLightFovBias(slot.resolution, light.shadows == LightShadows.Soft);
+                            ok = ShadowUtils.ExtractPointLightMatrix(ref cullResults, shadowData, visibleLightIndex, (CubemapFace)face, fovBias, out shadowTransform, out view, out proj, out ShadowSplitData _);
+                        }
+
+                        if (!ok) continue;
+
+                        int globalSliceIndex = this._frameSlices.Count;
+                        if (perLightFirstSlice < 0) perLightFirstSlice = globalSliceIndex;
+
+                        Matrix4x4 sliceTransform = Matrix4x4.identity;
+
+                        float invAtlas = 1f / this._atlasSize;
+
+                        sliceTransform.m00 = slot.resolution * invAtlas;
+                        sliceTransform.m11 = slot.resolution * invAtlas;
+                        sliceTransform.m03 = slot.offsetX * invAtlas;
+                        sliceTransform.m13 = slot.offsetY * invAtlas;
+
+                        this._worldToShadow[globalSliceIndex] = sliceTransform * shadowTransform;
+
+                        Vector4 bias = ShadowUtils.GetShadowBias(ref visibleLight, visibleLightIndex, shadowData, proj, slot.resolution);
+
+                        this._frameSlices.Add(new FrameSlice {
+                            visibleLightIndex = visibleLightIndex,
+                            lightId = lightId,
+                            category = category,
+                            viewMatrix = view,
+                            projMatrix = proj,
+                            offsetX = slot.offsetX,
+                            offsetY = slot.offsetY,
+                            resolution = slot.resolution,
+                            staticDirty = needsStaticBake,
+                            freshUnbaked = fresh && cachedSlot && !needsStaticBake,
+                            hasBakeCull = hasBakeCull,
+                            bakeCull = bakeCull,
+                            bakeLightIndex = bakeLightIndex,
+                            bias = bias,
+                            lightPosition = lightPosition
+                        });
+
+                        addedAny = true;
                     }
 
-                    if (!ok) continue;
+                    if (!aborted) break;
 
-                    int globalSliceIndex = this._frameSlices.Count;
-                    if (perLightFirstSlice < 0) perLightFirstSlice = globalSliceIndex;
+                    if (this._frameSlices.Count > firstLightSlice) this._frameSlices.RemoveRange(firstLightSlice, this._frameSlices.Count - firstLightSlice);
+                    addedAny = false;
 
-                    Matrix4x4 sliceTransform = Matrix4x4.identity;
+                    for (int face = 0; face < perLightSlices; face++)
+                    {
+                        int sliceKey = lightId.GetHashCode() * 6 + face;
+                        if (!this._slots.TryGetValue(sliceKey, out Slot stale)) continue;
 
-                    float invAtlas = 1f / Mathf.NextPowerOfTwo(Mathf.Max(this._feature.atlasSize, 256));
+                        this.FreeSlot(stale);
+                        this._slots.Remove(sliceKey);
+                    }
 
-                    sliceTransform.m00 = slot.resolution * invAtlas;
-                    sliceTransform.m11 = slot.resolution * invAtlas;
-                    sliceTransform.m03 = slot.offsetX * invAtlas;
-                    sliceTransform.m13 = slot.offsetY * invAtlas;
-
-                    this._worldToShadow[globalSliceIndex] = sliceTransform * shadowTransform;
-
-                    Vector4 bias = ShadowUtils.GetShadowBias(ref visibleLight, visibleLightIndex, shadowData, proj, slot.resolution);
-                    Vector3 lightPosition = visibleLight.localToWorldMatrix.GetColumn(3);
-
-                    this._frameSlices.Add(new FrameSlice {
-                        visibleLightIndex = visibleLightIndex,
-                        lightId = lightId,
-                        category = category,
-                        viewMatrix = view,
-                        projMatrix = proj,
-                        offsetX = slot.offsetX,
-                        offsetY = slot.offsetY,
-                        resolution = slot.resolution,
-                        staticDirty = needsStaticBake,
-                        hasBakeCull = hasBakeCull,
-                        bakeCull = bakeCull,
-                        bakeLightIndex = bakeLightIndex,
-                        bias = bias,
-                        lightPosition = lightPosition
-                    });
-
-                    addedAny = true;
+                    this._feature.InvalidateStaticBake(lightId);
+                    
+                    if (!atlasFull || allocRes <= 16) break;
+                    allocRes >>= 1;
                 }
 
                 if (addedAny)
@@ -322,14 +375,12 @@ namespace FailCake
             }
 
             this._softShadows = anySoft;
-            this.FreeStaleSlots(frame);
-
             return this._frameSlices.Count;
         }
 
 
         private int ResolutionFor(SliceCategory category, CachedShadowLight cache, UniversalShadowData shadowData, int visibleLightIndex) {
-            int atlas = Mathf.NextPowerOfTwo(Mathf.Max(this._feature.atlasSize, 256));
+            int atlas = this._atlasSize;
 
             int res;
             if (category == SliceCategory.REALTIME)
@@ -345,10 +396,12 @@ namespace FailCake
 
         #region PACKER
 
-        private bool TryGetOrAllocSlot(int sliceKey, EntityId lightId, int resolution, int frame, out Slot slot) {
+        private bool TryGetOrAllocSlot(int sliceKey, EntityId lightId, int requestedResolution, int allocResolution, bool cached, int frame, out Slot slot, out bool fresh) {
+            fresh = false;
+
             if (this._slots.TryGetValue(sliceKey, out slot))
             {
-                if (slot.resolution != resolution)
+                if (slot.resolution != allocResolution)
                 {
                     this.FreeSlot(slot);
 
@@ -358,85 +411,153 @@ namespace FailCake
                 else
                 {
                     slot.lastSeenFrame = frame;
+                    slot.requestedResolution = requestedResolution;
+                    slot.cached = cached;
                     this._slots[sliceKey] = slot;
                     return true;
                 }
             }
 
-            if (!this.AllocRect(resolution, out int x, out int y))
+            if (!this.AllocRect(allocResolution, out int x, out int y) && !this.TryEvictAndAlloc(allocResolution, frame, out x, out y))
             {
                 slot = default(Slot);
                 return false;
             }
 
-            slot = new Slot { offsetX = x, offsetY = y, resolution = resolution, lightId = lightId, lastSeenFrame = frame };
+            slot = new Slot { offsetX = x, offsetY = y, resolution = allocResolution, requestedResolution = requestedResolution, cached = cached, lightId = lightId, lastSeenFrame = frame };
             this._slots[sliceKey] = slot;
+            fresh = true;
             return true;
         }
 
         private bool AllocRect(int resolution, out int x, out int y) {
-            if (this._freeByResolution.TryGetValue(resolution, out Stack<Vector2Int> free) && free.Count > 0)
+            HashSet<Vector2Int> free = this.FreeSet(resolution);
+            if (free.Count > 0)
             {
-                Vector2Int p = free.Pop();
+                Vector2Int p = default(Vector2Int);
+                foreach (Vector2Int q in free)
+                {
+                    p = q;
+                    break;
+                }
+
+                free.Remove(p);
                 x = p.x;
                 y = p.y;
                 return true;
             }
 
-            int atlas = Mathf.NextPowerOfTwo(Mathf.Max(this._feature.atlasSize, 256));
-            if (resolution > atlas)
+            if (resolution >= this._atlasSize || !this.AllocRect(resolution * 2, out int px, out int py))
             {
                 x = y = 0;
                 return false;
             }
 
-            if (this._cursorX + resolution > atlas)
-            {
-                this._cursorX = 0;
-                this._cursorY += this._rowHeight;
-                this._rowHeight = 0;
-            }
+            free.Add(new Vector2Int(px + resolution, py));
+            free.Add(new Vector2Int(px, py + resolution));
+            free.Add(new Vector2Int(px + resolution, py + resolution));
 
-            if (this._cursorY + resolution > atlas)
-            {
-                x = y = 0;
-                return false;
-            }
-
-            x = this._cursorX;
-            y = this._cursorY;
-
-            this._cursorX += resolution;
-            if (resolution > this._rowHeight) this._rowHeight = resolution;
+            x = px;
+            y = py;
             return true;
         }
 
         private void FreeSlot(Slot slot) {
-            if (!this._freeByResolution.TryGetValue(slot.resolution, out Stack<Vector2Int> free))
+            int x = slot.offsetX;
+            int y = slot.offsetY;
+            int size = slot.resolution;
+
+            while (size < this._atlasSize)
             {
-                free = new Stack<Vector2Int>();
-                this._freeByResolution[slot.resolution] = free;
+                int parentSize = size * 2;
+                int px = x & ~(parentSize - 1);
+                int py = y & ~(parentSize - 1);
+
+                HashSet<Vector2Int> free = this.FreeSet(size);
+                Vector2Int self = new Vector2Int(x, y);
+
+                Vector2Int q0 = new Vector2Int(px, py);
+                Vector2Int q1 = new Vector2Int(px + size, py);
+                Vector2Int q2 = new Vector2Int(px, py + size);
+                Vector2Int q3 = new Vector2Int(px + size, py + size);
+
+                bool merge = (q0 == self || free.Contains(q0))
+                             && (q1 == self || free.Contains(q1))
+                             && (q2 == self || free.Contains(q2))
+                             && (q3 == self || free.Contains(q3));
+
+                if (!merge)
+                {
+                    free.Add(self);
+                    return;
+                }
+
+                free.Remove(q0);
+                free.Remove(q1);
+                free.Remove(q2);
+                free.Remove(q3);
+
+                x = px;
+                y = py;
+                size = parentSize;
             }
 
-            free.Push(new Vector2Int(slot.offsetX, slot.offsetY));
+            this.FreeSet(size).Add(new Vector2Int(x, y));
         }
 
-        private void FreeStaleSlots(int frame) {
-            List<int> toRemove = null;
+        private HashSet<Vector2Int> FreeSet(int size) {
+            if (this._freeBlocks.TryGetValue(size, out HashSet<Vector2Int> set)) return set;
+
+            set = new HashSet<Vector2Int>();
+            this._freeBlocks[size] = set;
+            return set;
+        }
+
+        private bool TryEvictAndAlloc(int resolution, int frame, out int x, out int y) {
+            List<int> stale = null;
             foreach (KeyValuePair<int, Slot> kv in this._slots)
             {
-                if (frame - kv.Value.lastSeenFrame < 90) continue;
-                (toRemove ??= new List<int>()).Add(kv.Key);
+                if (kv.Value.lastSeenFrame == frame) continue;
+                (stale ??= new List<int>()).Add(kv.Key);
             }
 
-            if (toRemove == null) return;
-            for (int i = 0; i < toRemove.Count; i++)
+            if (stale != null)
             {
-                Slot slot = this._slots[toRemove[i]];
-                this.FreeSlot(slot);
-                this._feature.InvalidateStaticBake(slot.lightId);
-                this._slots.Remove(toRemove[i]);
+                stale.Sort((a, b) => {
+                    Slot sa = this._slots[a];
+                    Slot sb = this._slots[b];
+
+                    if (sa.cached != sb.cached) return sa.cached ? 1 : -1;
+                    return sa.lastSeenFrame.CompareTo(sb.lastSeenFrame);
+                });
+
+                for (int i = 0; i < stale.Count; i++)
+                {
+                    Slot victim = this._slots[stale[i]];
+
+                    this.FreeSlot(victim);
+                    this._slots.Remove(stale[i]);
+                    this._feature.InvalidateStaticBake(victim.lightId);
+
+                    if (this.AllocRect(resolution, out x, out y)) return true;
+                }
             }
+
+            x = y = 0;
+            return false;
+        }
+
+        private void SyncPacker() {
+            int desired = Mathf.NextPowerOfTwo(Mathf.Clamp(this._feature.atlasSize, 256, SystemInfo.maxTextureSize));
+            if (desired == this._atlasSize) return;
+
+            this._atlasSize = desired;
+
+            this._slots.Clear();
+            this._freeBlocks.Clear();
+            this.FreeSet(desired).Add(Vector2Int.zero);
+
+            this._feature.Invalidate();
         }
 
         #endregion
@@ -475,8 +596,6 @@ namespace FailCake
                             ShadowDrawingSettings ss = this.MakeSettings(fs.bakeCull, fs.bakeLightIndex, ShadowObjectsFilter.StaticOnly, useLayers);
                             fs.listStatic = renderGraph.CreateShadowRendererList(ref ss);
                         }
-
-  
                         ShadowDrawingSettings sd = fs.hasBakeCull
                             ? this.MakeSettings(fs.bakeCull, fs.bakeLightIndex, ShadowObjectsFilter.DynamicOnly, useLayers)
                             : this.MakeSettings(cullResults, fs.visibleLightIndex, ShadowObjectsFilter.DynamicOnly, useLayers);
@@ -501,6 +620,7 @@ namespace FailCake
 
             passData.pass = this;
             passData.slices = this._frameSlices;
+            passData.clearAtlas = this._atlasDirty;
 
             for (int i = 0; i < this._frameSlices.Count; i++)
             {
@@ -520,6 +640,7 @@ namespace FailCake
             passData.pass = this;
             passData.slices = this._frameSlices;
             passData.staticAtlas = this._staticAtlas;
+            passData.clearAtlas = this._atlasDirty;
 
             for (int i = 0; i < this._frameSlices.Count; i++)
             {
@@ -551,6 +672,8 @@ namespace FailCake
             RasterCommandBuffer cmd = ctx.cmd;
             CachedAdditionalShadowsPass pass = data.pass;
 
+            if (data.clearAtlas) pass.ClearSlot(cmd, 0, 0, pass._allocatedAtlasSize);
+
             Vector4 lastBias = new Vector4(-10f, -10f, -10f, -10f);
 
             for (int i = 0; i < data.slices.Count; i++)
@@ -580,6 +703,8 @@ namespace FailCake
             CachedAdditionalShadowsPass pass = data.pass;
 
             cmd.SetKeyword(CachedAdditionalShadowsPass._kCastingPunctualLightShadow, true);
+
+            if (data.clearAtlas) pass.ClearSlot(cmd, 0, 0, pass._allocatedAtlasSize);
 
             Vector4 lastBias = new Vector4(-10f, -10f, -10f, -10f);
 
@@ -611,7 +736,12 @@ namespace FailCake
 
                     case SliceCategory.CACHED_STATIC:
                     {
-                        if (!fs.staticDirty) continue;
+                        if (!fs.staticDirty)
+                        {
+                            if (fs.freshUnbaked) pass.ClearSlot(cmd, fs.offsetX, fs.offsetY, fs.resolution);
+                            continue;
+                        }
+
                         if (!fs.listStatic.IsValid()) continue;
 
                         pass.ClearSlot(cmd, fs.offsetX, fs.offsetY, fs.resolution);
@@ -625,7 +755,9 @@ namespace FailCake
 
                     case SliceCategory.CACHED_DYNAMIC:
                     {
-                        pass.CopyStaticSlot(cmd, data.staticAtlas, fs.offsetX, fs.offsetY, fs.resolution);
+                        if (fs.freshUnbaked) pass.ClearSlot(cmd, fs.offsetX, fs.offsetY, fs.resolution);
+                        else pass.CopyStaticSlot(cmd, data.staticAtlas, fs.offsetX, fs.offsetY, fs.resolution);
+
                         if (fs.listDynamic.IsValid())
                         {
                             RendererList list = fs.listDynamic;
@@ -684,21 +816,17 @@ namespace FailCake
         }
 
         private void EnsureAtlases() {
-            int desired = Mathf.NextPowerOfTwo(Mathf.Max(this._feature.atlasSize, 256));
-            if (this._allocatedAtlasSize == desired && this._mainAtlas != null && this._staticAtlas != null) return;
+            if (this._allocatedAtlasSize == this._atlasSize && this._mainAtlas != null && this._staticAtlas != null) return;
 
             this._mainAtlas?.Release();
             this._staticAtlas?.Release();
-            this._slots.Clear();
-            this._freeByResolution.Clear();
 
-            this._cursorX = 0;
-            this._cursorY = 0;
-            this._rowHeight = 0;
+            this._allocatedAtlasSize = this._atlasSize;
 
-            this._allocatedAtlasSize = desired;
-            this._mainAtlas = ShadowUtils.AllocShadowRT(desired, desired, CachedAdditionalShadowsPass.SHADOWMAP_BITS, 1, 0, "_AdditionalLightsShadowmapTexture");
-            this._staticAtlas = ShadowUtils.AllocShadowRT(desired, desired, CachedAdditionalShadowsPass.SHADOWMAP_BITS, 1, 0, "_CachedAdditionalLightsStaticShadowmap");
+            this._mainAtlas = ShadowUtils.AllocShadowRT(this._allocatedAtlasSize, this._allocatedAtlasSize, CachedAdditionalShadowsPass.SHADOWMAP_BITS, 1, 0, "_AdditionalLightsShadowmapTexture");
+            this._staticAtlas = ShadowUtils.AllocShadowRT(this._allocatedAtlasSize, this._allocatedAtlasSize, CachedAdditionalShadowsPass.SHADOWMAP_BITS, 1, 0, "_CachedAdditionalLightsStaticShadowmap");
+
+            this._atlasDirty = true;
         }
 
         private void FindBlitMaterial() {
@@ -766,6 +894,8 @@ namespace FailCake
             public int offsetX;
             public int offsetY;
             public int resolution;
+            public int requestedResolution;
+            public bool cached;
             public EntityId lightId;
             public int lastSeenFrame;
         }
@@ -786,6 +916,7 @@ namespace FailCake
             public int resolution;
 
             public bool staticDirty;
+            public bool freshUnbaked;
             public bool hasBakeCull;
 
             public CullingResults bakeCull;
@@ -803,6 +934,7 @@ namespace FailCake
         {
             public CachedAdditionalShadowsPass pass;
             public List<FrameSlice> slices;
+            public bool clearAtlas;
         }
 
         private class MainPassData
@@ -810,6 +942,7 @@ namespace FailCake
             public CachedAdditionalShadowsPass pass;
             public List<FrameSlice> slices;
             public RTHandle staticAtlas;
+            public bool clearAtlas;
         }
 
         private class PostPassData

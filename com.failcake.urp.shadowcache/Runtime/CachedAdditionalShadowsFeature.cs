@@ -168,6 +168,9 @@ namespace FailCake
 
             GeometryUtility.CalculateFrustumPlanes(cam, this._frustumPlanes);
 
+            Vector3 camPos = cam.transform.position;
+            float shadowDistance = UniversalRenderPipeline.asset ? UniversalRenderPipeline.asset.shadowDistance : float.MaxValue;
+
             foreach (KeyValuePair<EntityId, CachedShadowLight> kv in this._byLightId)
             {
                 EntityId id = kv.Key;
@@ -182,6 +185,10 @@ namespace FailCake
                 if (range <= 0f) continue;
 
                 Vector3 lightPos = light.transform.position;
+
+                float fadeDistance = shadowDistance + range;
+                if ((lightPos - camPos).sqrMagnitude > fadeDistance * fadeDistance) continue;
+
                 Bounds influence = new Bounds(lightPos, Vector3.one * (range * 2f));
 
                 if (!GeometryUtility.TestPlanesAABB(this._frustumPlanes, influence)) continue;
