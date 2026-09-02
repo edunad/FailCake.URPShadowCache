@@ -545,18 +545,18 @@ namespace FailCake
                     }
                 }
 
-                if (!slot.hasRenderedOnce) continue;
+            if (!slot.hasRenderedOnce) continue;
 
-                this._shadowParams[info.paramIndex].z = slot.isPoint ? CachedShadowPass.LIGHT_TYPE_POINT : CachedShadowPass.LIGHT_TYPE_SPOT;
-                this._shadowParams[info.paramIndex].w = slot.firstEntry;
+            this._shadowParams[info.paramIndex].z = slot.isPoint ? CachedShadowPass.LIGHT_TYPE_POINT : CachedShadowPass.LIGHT_TYPE_SPOT;
+            this._shadowParams[info.paramIndex].w = slot.firstEntry;
+            for (int s = 0; s < slot.sliceCount; s++)
+            {
+                int entry = slot.firstEntry + s;
 
-                for (int s = 0; s < slot.sliceCount; s++)
-                {
-                    int entry = slot.firstEntry + s;
-                    this._copySliceEntries.Add(entry);
-                    if (hasShadowCasters) this._dynamicSliceEntries.Add(entry);
-                }
+                this._copySliceEntries.Add(entry);
+                if (hasShadowCasters && light.intensity > 0f) this._dynamicSliceEntries.Add(entry);
             }
+        }
         }
 
         private int BlockDimFor(UniversalShadowData shadowData, int visibleIndex) {
@@ -747,6 +747,7 @@ namespace FailCake
 
         private bool EvictOne(EntityId excludeId) {
             LightSlot victim = null;
+            LightSlot oldestRendered = null;
 
             foreach (KeyValuePair<EntityId, LightSlot> pair in this._slots)
             {
@@ -754,9 +755,17 @@ namespace FailCake
                 if (candidate.lightId == excludeId) continue;
                 if (this._visibleIds.Contains(candidate.lightId)) continue;
 
-                if (victim == null || candidate.lastSeenFrame < victim.lastSeenFrame) victim = candidate;
+                if (!candidate.hasRenderedOnce)
+                {
+                    if (victim == null || candidate.lastSeenFrame < victim.lastSeenFrame) victim = candidate;
+                }
+                else
+                {
+                    if (oldestRendered == null || candidate.lastSeenFrame < oldestRendered.lastSeenFrame) oldestRendered = candidate;
+                }
             }
 
+            if (victim == null) victim = oldestRendered;
             if (victim == null) return false;
 
             this.FreeSlot(victim);

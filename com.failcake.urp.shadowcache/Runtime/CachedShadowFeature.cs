@@ -150,8 +150,10 @@ namespace FailCake
                 VisibleLight visibleLight = lights[i];
                 Light light = visibleLight.light;
                 if (!light) continue;
+
                 if (visibleLight.lightType != LightType.Spot && visibleLight.lightType != LightType.Point) continue;
                 if (light.shadows == LightShadows.None || light.shadowStrength <= 0f) continue;
+
                 if (!this._pass.Prepare(renderingData.shadowData)) return;
 
                 renderingData.shadowData.supportsAdditionalLightShadows = false;
