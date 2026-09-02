@@ -8,8 +8,6 @@ Shader "Hidden/FailCake/CachedShadowSliceBlit"
             "RenderPipeline" = "UniversalPipeline"
         }
 
-        // Copies one tile of the static atlas into the same tile of the sampled atlas. Both atlases share a layout and the
-        // caller sets the viewport to the tile, so a same-pixel LOAD is a 1:1 copy with no UV origin or Y-flip conventions.
         Pass
         {
             Name "CachedShadowSliceCopyDepth"
@@ -26,7 +24,6 @@ Shader "Hidden/FailCake/CachedShadowSliceBlit"
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
 
-            // Plain TEXTURE2D, not _X: the atlas is shared, not one slice per eye, so stereo indexing would be wrong in VR.
             TEXTURE2D_FLOAT(_FailCakeCachedShadowSource);
 
             struct Varyings
@@ -34,7 +31,6 @@ Shader "Hidden/FailCake/CachedShadowSliceBlit"
                 float4 positionCS : SV_POSITION;
             };
 
-            // The caller's viewport clips this to the tile. Depth comes from the fragment, so the vertex z doesn't matter.
             Varyings Vert(uint vertexID : SV_VertexID)
             {
                 Varyings output;
@@ -50,8 +46,6 @@ Shader "Hidden/FailCake/CachedShadowSliceBlit"
             ENDHLSL
         }
 
-        // Clears one atlas tile to far depth. ClearRenderTarget ignores the viewport and would wipe every other light's
-        // tile, so draw a triangle at the far plane instead and let the viewport clip it.
         Pass
         {
             Name "CachedShadowSliceClearDepth"
@@ -68,14 +62,12 @@ Shader "Hidden/FailCake/CachedShadowSliceBlit"
 
             #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
 
-            // UNITY_RAW_FAR_CLIP_VALUE handles reversed-Z for us.
             float4 Vert(uint vertexID : SV_VertexID) : SV_POSITION
             {
                 float2 uv = float2((vertexID << 1) & 2, vertexID & 2);
                 return float4(uv * 2.0 - 1.0, UNITY_RAW_FAR_CLIP_VALUE, 1.0);
             }
 
-            // ColorMask 0 throws this away, but some backends reject a fragment stage with no output.
             half4 Frag() : SV_Target { return 0; }
             ENDHLSL
         }
