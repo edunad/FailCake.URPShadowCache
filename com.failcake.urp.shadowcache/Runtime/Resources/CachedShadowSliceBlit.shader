@@ -8,6 +8,8 @@ Shader "Hidden/FailCake/CachedShadowSliceBlit"
             "RenderPipeline" = "UniversalPipeline"
         }
 
+        // Copies one tile of the static atlas into the same tile of the sampled atlas. Both atlases share a layout and the
+        // caller sets the viewport to the tile, so a same-pixel LOAD is a 1:1 copy with no UV origin or Y-flip conventions.
         Pass
         {
             Name "CachedShadowSliceCopyDepth"
@@ -23,19 +25,37 @@ Shader "Hidden/FailCake/CachedShadowSliceBlit"
             #pragma target 4.5
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
-            #include "Packages/com.unity.render-pipelines.core/Runtime/Utilities/Blit.hlsl"
 
-            float Frag(Varyings input) : SV_Depth
+            // Plain TEXTURE2D, not _X: the atlas is shared, not one slice per eye, so stereo indexing would be wrong in VR.
+            TEXTURE2D_FLOAT(_FailCakeCachedShadowSource);
+
+            struct Varyings
             {
-                UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
-                return SAMPLE_TEXTURE2D_X_LOD(_BlitTexture, sampler_PointClamp, input.texcoord.xy, 0).r;
+                float4 positionCS : SV_POSITION;
+            };
+
+            // The caller's viewport clips this to the tile. Depth comes from the fragment, so the vertex z doesn't matter.
+            Varyings Vert(uint vertexID : SV_VertexID)
+            {
+                Varyings output;
+                float2 uv = float2((vertexID << 1) & 2, vertexID & 2);
+                output.positionCS = float4(uv * 2.0 - 1.0, UNITY_RAW_FAR_CLIP_VALUE, 1.0);
+                return output;
+            }
+
+            void Frag(Varyings input, out float outDepth : SV_Depth)
+            {
+                outDepth = LOAD_TEXTURE2D(_FailCakeCachedShadowSource, int2(input.positionCS.xy)).r;
             }
             ENDHLSL
         }
 
+        // Clears one atlas tile to far depth. ClearRenderTarget ignores the viewport and would wipe every other light's
+        // tile, so draw a triangle at the far plane instead and let the viewport clip it.
         Pass
         {
-            Name "CachedShadowSliceClear"
+            Name "CachedShadowSliceClearDepth"
+
             ZWrite On
             ZTest Always
             Cull Off
@@ -43,21 +63,20 @@ Shader "Hidden/FailCake/CachedShadowSliceBlit"
 
             HLSLPROGRAM
             #pragma vertex Vert
-            #pragma fragment FragClear
+            #pragma fragment Frag
             #pragma target 4.5
 
-            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
-            #include "Packages/com.unity.render-pipelines.core/Runtime/Utilities/Blit.hlsl"
+            #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
 
-            float FragClear(Varyings input) : SV_Depth
+            // UNITY_RAW_FAR_CLIP_VALUE handles reversed-Z for us.
+            float4 Vert(uint vertexID : SV_VertexID) : SV_POSITION
             {
-                UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
-                #if defined(UNITY_REVERSED_Z)
-                return 0.0;
-                #else
-                return 1.0;
-                #endif
+                float2 uv = float2((vertexID << 1) & 2, vertexID & 2);
+                return float4(uv * 2.0 - 1.0, UNITY_RAW_FAR_CLIP_VALUE, 1.0);
             }
+
+            // ColorMask 0 throws this away, but some backends reject a fragment stage with no output.
+            half4 Frag() : SV_Target { return 0; }
             ENDHLSL
         }
     }
