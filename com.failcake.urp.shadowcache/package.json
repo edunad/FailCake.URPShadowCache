@@ -1,9 +1,9 @@
 {
   "name": "com.failcake.urp.shadowcache",
   "displayName": "FailCake URP Shadow Cache",
-  "version": "0.2.0",
-  "unity": "6000.0",
-  "description": "Caches point and spot light shadows in URP. Renderer Static Shadow Caster flags separate cached geometry from live dynamic casters. Supports Forward+ and Deferred+.",
+  "version": "1.0.0",
+  "unity": "6000.5",
+  "description": "Caches point and spot light shadows in URP, supports Forward+ and Deferred+.",
   "type": "library",
   "keywords": [
     "shadow",
@@ -11,13 +11,15 @@
     "light",
     "urp",
     "rendering",
-    "forward+"
+    "forward+",
+    "deferred+"
   ],
   "dependencies": {
-    "com.unity.render-pipelines.universal": "17.0.0"
+    "com.unity.render-pipelines.universal": "17.5.0"
   },
   "author": {
     "name": "FailCake",
     "url": "https://github.com/edunad/FailCake.URPShadowCache"
-  }
+  },
+  "_fingerprint": "ed783a897719634391bf42e4c7b6e449a0f284f1"
 }

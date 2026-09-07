@@ -11,14 +11,56 @@ using UnityEngine.Rendering.Universal;
 
 #endregion
 
-namespace FailCake
+namespace HyenaQuest
 {
+    internal sealed class CachedShadowSlot
+    {
+        public EntityId lightId;
+
+        public int firstEntry;
+        public int sliceCount;
+        public int blockDim;
+
+        public bool isPoint;
+        public bool dirtyStatic;
+        public bool hasRenderedOnce;
+
+        public int lastSeenFrame;
+
+        public ulong contentHash;
+        public long refreshGeneration = -1;
+
+        public int lastUpdateFrame = -1;
+        public int dynamicFaceMask;
+        public bool compositeDirty = true;
+    }
+
+    internal sealed class CachedShadowPassData
+    {
+        public CachedShadowPass pass;
+        public UniversalCameraData cameraData;
+
+        public TextureHandle staticTexture;
+
+        public List<int> copyEntries;
+        public List<int> sliceEntries;
+
+        public List<RendererListHandle> lists;
+
+        public float maxShadowDistanceSq;
+        public float cascadeBorder;
+
+        public bool softShadows;
+    }
+
     internal sealed class CachedShadowPass : ScriptableRenderPass
     {
         #region STATIC
 
         private const int PASS_COPY = 0;
         private const int PASS_CLEAR = 1;
+
+        private const int MAX_COPY_TILES = 256;
 
         private const float LIGHT_TYPE_SPOT = 0f;
         private const float LIGHT_TYPE_POINT = 1f;
@@ -41,6 +83,11 @@ namespace FailCake
         private static readonly int ID_LIGHT_DIRECTION = Shader.PropertyToID("_LightDirection");
         private static readonly int ID_LIGHT_POSITION = Shader.PropertyToID("_LightPosition");
         private static readonly int ID_COPY_SOURCE = Shader.PropertyToID("_FailCakeCachedShadowSource");
+        private static readonly int ID_COPY_TILES = Shader.PropertyToID("_FailCakeCachedShadowTiles");
+        private static readonly int ID_COPY_ATLAS_SIZE = Shader.PropertyToID("_FailCakeCachedShadowAtlasSize");
+
+        private static readonly FieldInfo ATLAS_LAYOUT = typeof(UniversalShadowData).GetField("shadowAtlasLayout", BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly FieldInfo ATLAS_LIGHT_INDICES = CachedShadowPass.ATLAS_LAYOUT?.FieldType.GetField("m_VisibleLightIndexToSortedShadowResolutionRequestsFirstSliceIndex", BindingFlags.Instance | BindingFlags.NonPublic);
 
         private static readonly GlobalKeyword K_ADDITIONAL_LIGHT_SHADOWS = GlobalKeyword.Create(ShaderKeywordStrings.AdditionalLightShadows);
         private static readonly GlobalKeyword K_CASTING_PUNCTUAL_LIGHT_SHADOW = GlobalKeyword.Create(ShaderKeywordStrings.CastingPunctualLightShadow);
@@ -49,19 +96,43 @@ namespace FailCake
         private static readonly GlobalKeyword K_SOFT_SHADOWS_MEDIUM = GlobalKeyword.Create(ShaderKeywordStrings.SoftShadowsMedium);
         private static readonly GlobalKeyword K_SOFT_SHADOWS_HIGH = GlobalKeyword.Create(ShaderKeywordStrings.SoftShadowsHigh);
 
-        private static PropertyInfo S_PIPELINE_SOFT_QUALITY_PROPERTY;
-        private static FieldInfo S_PIPELINE_SOFT_QUALITY_FIELD;
+        private static Func<UniversalRenderPipelineAsset, SoftShadowQuality> PIPELINE_SOFT_QUALITY;
         private static FieldInfo S_ADDITIONAL_KEYWORD_FIELD;
         private static FieldInfo S_SOFT_KEYWORD_FIELD;
 
         private static int S_IS_XR_MOBILE = -1;
 
+        private static ulong HashValue(ulong hash, int value) {
+            return unchecked((hash ^ (uint)value) * 1099511628211UL);
+        }
+
+        private static ulong GetLightHash(ref VisibleLight visibleLight, Light light, UniversalShadowData shadowData, int visibleIndex, float softQuality) {
+            ulong hash = 14695981039346656037UL;
+            for (int i = 0; i < 16; i++) hash = CachedShadowPass.HashValue(hash, visibleLight.localToWorldMatrix[i].GetHashCode());
+
+            hash = CachedShadowPass.HashValue(hash, visibleLight.range.GetHashCode());
+            hash = CachedShadowPass.HashValue(hash, visibleLight.spotAngle.GetHashCode());
+            hash = CachedShadowPass.HashValue(hash, light.shadowNearPlane.GetHashCode());
+            hash = CachedShadowPass.HashValue(hash, (int)light.shadows);
+            hash = CachedShadowPass.HashValue(hash, light.cullingMask);
+            hash = CachedShadowPass.HashValue(hash, light.renderingLayerMask);
+            hash = CachedShadowPass.HashValue(hash, softQuality.GetHashCode());
+            hash = CachedShadowPass.HashValue(hash, shadowData.supportsSoftShadows ? 1 : 0);
+            hash = CachedShadowPass.HashValue(hash, UniversalRenderPipeline.asset.useRenderingLayers ? 1 : 0);
+
+            if (shadowData.bias == null || visibleIndex >= shadowData.bias.Count) return hash;
+
+            hash = CachedShadowPass.HashValue(hash, shadowData.bias[visibleIndex].x.GetHashCode());
+            hash = CachedShadowPass.HashValue(hash, shadowData.bias[visibleIndex].y.GetHashCode());
+
+            return hash;
+        }
+
         private static void GetLinearDistanceFadeParams(float fadeDistanceSq, float cascadeBorder, out float fadeScale, out float fadeBias) {
             if (cascadeBorder < 0.0001f)
             {
-                const float MULTIPLIER = 1000f;
-                fadeScale = MULTIPLIER;
-                fadeBias = -fadeDistanceSq * MULTIPLIER;
+                fadeScale = 1000f;
+                fadeBias = -fadeDistanceSq * 1000f;
                 return;
             }
 
@@ -91,6 +162,7 @@ namespace FailCake
             if (!perLightQuality)
             {
                 SoftShadowQuality quality = CachedShadowPass.TryGetPipelineSoftShadowQuality(out SoftShadowQuality resolved) ? resolved : SoftShadowQuality.Medium;
+
                 bool low = softEnabled && quality == SoftShadowQuality.Low;
                 bool medium = softEnabled && quality == SoftShadowQuality.Medium;
                 bool high = softEnabled && quality == SoftShadowQuality.High;
@@ -114,23 +186,16 @@ namespace FailCake
             UniversalRenderPipelineAsset asset = UniversalRenderPipeline.asset;
             if (!asset) return false;
 
-            if (CachedShadowPass.S_PIPELINE_SOFT_QUALITY_PROPERTY == null)
+            if (CachedShadowPass.PIPELINE_SOFT_QUALITY == null)
             {
                 const BindingFlags FLAGS = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
+                MethodInfo getter = typeof(UniversalRenderPipelineAsset).GetProperty("softShadowQuality", FLAGS)?.GetGetMethod(true);
 
-                CachedShadowPass.S_PIPELINE_SOFT_QUALITY_PROPERTY = typeof(UniversalRenderPipelineAsset).GetProperty("softShadowQuality", FLAGS);
-                if (CachedShadowPass.S_PIPELINE_SOFT_QUALITY_PROPERTY == null) CachedShadowPass.S_PIPELINE_SOFT_QUALITY_FIELD = typeof(UniversalRenderPipelineAsset).GetField("m_SoftShadowQuality", FLAGS);
+                if (getter == null) throw new UnityException("Unable to resolve URP soft shadow quality");
+                CachedShadowPass.PIPELINE_SOFT_QUALITY = (Func<UniversalRenderPipelineAsset, SoftShadowQuality>)Delegate.CreateDelegate(typeof(Func<UniversalRenderPipelineAsset, SoftShadowQuality>), getter);
             }
 
-            if (CachedShadowPass.S_PIPELINE_SOFT_QUALITY_PROPERTY != null)
-            {
-                quality = (SoftShadowQuality)CachedShadowPass.S_PIPELINE_SOFT_QUALITY_PROPERTY.GetValue(asset);
-                return true;
-            }
-
-            if (CachedShadowPass.S_PIPELINE_SOFT_QUALITY_FIELD == null) return false;
-
-            quality = (SoftShadowQuality)CachedShadowPass.S_PIPELINE_SOFT_QUALITY_FIELD.GetValue(asset);
+            quality = CachedShadowPass.PIPELINE_SOFT_QUALITY(asset);
             return true;
         }
 
@@ -146,6 +211,53 @@ namespace FailCake
             if (value is bool and true) CachedShadowPass.S_IS_XR_MOBILE = 1;
 
             return CachedShadowPass.S_IS_XR_MOBILE == 1;
+        }
+
+        private static void ExecuteStaticBake(CachedShadowPassData data, RasterGraphContext ctx) {
+            RasterCommandBuffer cmd = ctx.cmd;
+            CachedShadowPass pass = data.pass;
+
+            cmd.SetKeyword(CachedShadowPass.K_CASTING_PUNCTUAL_LIGHT_SHADOW, true);
+            cmd.DisableScissorRect();
+            cmd.SetGlobalDepthBias(0f, 0f);
+
+            for (int i = 0; i < data.sliceEntries.Count; i++)
+            {
+                int entry = data.sliceEntries[i];
+                pass.SetupSliceGlobals(cmd, entry);
+                pass.ClearTile(cmd, entry);
+
+                RendererList rendererList = data.lists[i];
+                pass.RenderSlice(cmd, entry, rendererList);
+            }
+
+            CachedShadowPass.RestoreCameraViewProjection(cmd, data.cameraData);
+        }
+
+        private static void ExecuteMain(CachedShadowPassData data, RasterGraphContext ctx) {
+            RasterCommandBuffer cmd = ctx.cmd;
+            CachedShadowPass pass = data.pass;
+
+            if (data.copyEntries.Count > 0 || data.sliceEntries.Count > 0)
+            {
+                cmd.SetKeyword(CachedShadowPass.K_CASTING_PUNCTUAL_LIGHT_SHADOW, true);
+                pass.CopyTiles(cmd, data.staticTexture, data.copyEntries);
+
+                for (int i = 0; i < data.sliceEntries.Count; i++)
+                {
+                    int entry = data.sliceEntries[i];
+                    pass.SetupSliceGlobals(cmd, entry);
+
+                    RendererList rendererList = data.lists[i];
+                    pass.RenderSlice(cmd, entry, rendererList);
+                }
+            }
+
+            cmd.SetKeyword(CachedShadowPass.K_ADDITIONAL_LIGHT_SHADOWS, true);
+            CachedShadowPass.SetSoftShadowKeywords(cmd, data.softShadows);
+
+            pass.SetupReceiverConstants(cmd, data.maxShadowDistanceSq, data.cascadeBorder, data.softShadows);
+            CachedShadowPass.RestoreCameraViewProjection(cmd, data.cameraData);
         }
 
         private static void SetShadowKeywordState(UniversalShadowData shadowData, bool softShadows) {
@@ -210,11 +322,13 @@ namespace FailCake
         #region PRIVATE
 
         private readonly CachedShadowFeature _feature;
+        private CachedShadowCasters _dynamicCasters;
 
         private Material _blitMaterial;
 
         private RTHandle _staticAtlas;
         private RTHandle _mainAtlas;
+
         private int _allocatedW;
         private int _allocatedH;
         private int _allocatedDepthBits;
@@ -225,20 +339,23 @@ namespace FailCake
         private int _cellRes;
         private int _gridX;
         private int _gridY;
+
         private bool[] _cellUsed;
 
-        private readonly Dictionary<EntityId, LightSlot> _slots = new Dictionary<EntityId, LightSlot>();
-        private readonly Dictionary<int, Stack<int>> _freeEntryRuns = new Dictionary<int, Stack<int>>();
+        private readonly Dictionary<EntityId, CachedShadowSlot> _slots = new Dictionary<EntityId, CachedShadowSlot>();
         private readonly HashSet<Light> _modifiedCullLights = new HashSet<Light>();
-        private int _nextFreeEntry;
+        private bool[] _entryUsed;
 
         private int[] _entryBlockX;
         private int[] _entryBlockY;
         private int[] _entryBlockRes;
         private int[] _entryVisibleIndex;
+        private int[] _entryFace;
+
         private Matrix4x4[] _worldToShadow;
         private Matrix4x4[] _entryView;
         private Matrix4x4[] _entryProj;
+
         private Vector4[] _entryBias;
         private Vector3[] _entryLightPos;
         private Vector3[] _entryLightDir;
@@ -254,8 +371,11 @@ namespace FailCake
         private readonly List<int> _dynamicSliceEntries = new List<int>();
         private readonly List<RendererListHandle> _dynamicLists = new List<RendererListHandle>();
         private readonly PreparedSlice[] _preparedSlices = new PreparedSlice[6];
+        private readonly Vector4[] _copyTiles = new Vector4[CachedShadowPass.MAX_COPY_TILES];
 
-        private long _cacheUpdateGeneration = -1;
+        private int _lastBudgetFrameId = -1;
+        private int _remainingStaticSlices;
+
         private bool _softThisFrame;
         private bool _softSupported;
 
@@ -268,11 +388,8 @@ namespace FailCake
             this.profilingSampler = new ProfilingSampler("CachedShadows_Main");
 
             Shader shader = Shader.Find(CachedShadowPass.BLIT_SHADER_NAME);
-            if (!shader)
-            {
-                Debug.LogError("[CachedShadows] Missing Resources shader 'Hidden/FailCake/CachedShadowSliceBlit'.");
-                return;
-            }
+            if (!shader) throw new UnityException("Missing shader Hidden/FailCake/CachedShadowSliceBlit");
+            if (CachedShadowPass.ATLAS_LIGHT_INDICES == null) throw new UnityException("Unable to resolve URP shadow atlas layout");
 
             this._blitMaterial = CoreUtils.CreateEngineMaterial(shader);
         }
@@ -292,6 +409,7 @@ namespace FailCake
             UniversalResourceData resources = frameData.Get<UniversalResourceData>();
 
             this.BuildVisibleList(lightData, shadowData, cameraData);
+            this.UpdateDynamicCasters();
             this.AllocateSlices(renderingData, lightData, shadowData);
 
             TextureHandle staticHandle = renderGraph.ImportTexture(this._staticAtlas);
@@ -300,13 +418,14 @@ namespace FailCake
             resources.additionalShadowsTexture = mainHandle;
 
             this.CreateRendererLists(renderGraph, renderingData);
+            CachedShadowPass.SetShadowKeywordState(shadowData, this._softThisFrame);
 
             float maxShadowDistanceSq = cameraData.maxShadowDistance * cameraData.maxShadowDistance;
             float cascadeBorder = shadowData.mainLightShadowCascadeBorder;
 
             if (this._staticSliceEntries.Count > 0)
             {
-                using IRasterRenderGraphBuilder builder = renderGraph.AddRasterRenderPass("CachedShadows_StaticBake", out StaticPassData passData, this.profilingSampler);
+                using IRasterRenderGraphBuilder builder = renderGraph.AddRasterRenderPass("CachedShadows_StaticBake", out CachedShadowPassData passData, this.profilingSampler);
 
                 passData.pass = this;
                 passData.cameraData = cameraData;
@@ -318,18 +437,17 @@ namespace FailCake
                 builder.SetRenderAttachmentDepth(staticHandle);
                 builder.AllowPassCulling(false);
                 builder.AllowGlobalStateModification(true);
-                builder.SetRenderFunc<StaticPassData>(CachedShadowPass.ExecuteStaticBake);
+                builder.SetRenderFunc<CachedShadowPassData>(CachedShadowPass.ExecuteStaticBake);
             }
 
-            using (IRasterRenderGraphBuilder builder = renderGraph.AddRasterRenderPass("CachedShadows_Main", out MainPassData passData, this.profilingSampler))
+            using (IRasterRenderGraphBuilder builder = renderGraph.AddRasterRenderPass("CachedShadows_Main", out CachedShadowPassData passData, this.profilingSampler))
             {
                 passData.pass = this;
                 passData.cameraData = cameraData;
-                passData.shadowData = shadowData;
                 passData.staticTexture = staticHandle;
                 passData.copyEntries = this._copySliceEntries;
-                passData.dynamicEntries = this._dynamicSliceEntries;
-                passData.dynamicLists = this._dynamicLists;
+                passData.sliceEntries = this._dynamicSliceEntries;
+                passData.lists = this._dynamicLists;
                 passData.maxShadowDistanceSq = maxShadowDistanceSq;
                 passData.cascadeBorder = cascadeBorder;
                 passData.softShadows = this._softThisFrame;
@@ -348,11 +466,13 @@ namespace FailCake
                 builder.AllowPassCulling(false);
                 builder.AllowGlobalStateModification(true);
                 builder.SetGlobalTextureAfterPass(mainHandle, CachedShadowPass.ID_ADDITIONAL_SHADOWMAP_TEXTURE);
-                builder.SetRenderFunc<MainPassData>(CachedShadowPass.ExecuteMain);
+                builder.SetRenderFunc<CachedShadowPassData>(CachedShadowPass.ExecuteMain);
             }
         }
 
         internal void Dispose() {
+            this._dynamicCasters?.Dispose();
+            this._dynamicCasters = null;
             foreach (Light light in this._modifiedCullLights)
                 if (light)
                     light.useViewFrustumForShadowCasterCull = true;
@@ -392,17 +512,23 @@ namespace FailCake
                 this._allocatedW = this._mainAtlas != null && this._mainAtlas.rt != null ? this._mainAtlas.rt.width : requestedW;
                 this._allocatedH = this._mainAtlas != null && this._mainAtlas.rt != null ? this._mainAtlas.rt.height : requestedH;
                 this._allocatedDepthBits = depthBits;
+
                 this._atlasW = Mathf.Min(this._allocatedW, requestedW);
                 this._atlasH = Mathf.Min(this._allocatedH, requestedH);
+
                 this._maxSlices = maxAdd;
                 this._cellRes = cell;
+
                 this._gridX = Mathf.Max(1, this._atlasW / cell);
                 this._gridY = Mathf.Max(1, this._atlasH / cell);
 
                 this._entryBlockX = new int[this._maxSlices];
                 this._entryBlockY = new int[this._maxSlices];
+
                 this._entryBlockRes = new int[this._maxSlices];
                 this._entryVisibleIndex = new int[this._maxSlices];
+                this._entryFace = new int[this._maxSlices];
+                this._entryUsed = new bool[this._maxSlices];
                 this._worldToShadow = new Matrix4x4[this._maxSlices];
                 this._entryView = new Matrix4x4[this._maxSlices];
                 this._entryProj = new Matrix4x4[this._maxSlices];
@@ -418,19 +544,24 @@ namespace FailCake
 
         private void ResetCache() {
             this._slots.Clear();
-            this._freeEntryRuns.Clear();
-            this._nextFreeEntry = 0;
+            this._visibleIds.Clear();
+
+            this._lastKeepFrameId = -1;
+            this._lastBudgetFrameId = -1;
 
             if (this._cellUsed != null) Array.Clear(this._cellUsed, 0, this._cellUsed.Length);
+            if (this._entryUsed != null) Array.Clear(this._entryUsed, 0, this._entryUsed.Length);
         }
 
         private void BuildVisibleList(UniversalLightData lightData, UniversalShadowData shadowData, UniversalCameraData cameraData) {
             this._visible.Clear();
             this._softSupported = shadowData.supportsSoftShadows;
 
-            for (int i = 0; i < this._shadowParams.Length; i++) this._shadowParams[i] = CachedShadowPass.DEFAULT_SHADOW_PARAMS;
+            for (int i = 0; i < this._shadowParams.Length; i++) this._shadowParams[i] = CachedShadowPass.DEFAULT_SHADOW_PARAMS; // RESET
 
             NativeArray<VisibleLight> lights = lightData.visibleLights;
+            NativeArray<int> shadowIndices = (NativeArray<int>)CachedShadowPass.ATLAS_LIGHT_INDICES.GetValue(CachedShadowPass.ATLAS_LAYOUT.GetValue(shadowData));
+
             int mainIndex = lightData.mainLightIndex;
             bool supportsSoft = shadowData.supportsSoftShadows;
             this._softThisFrame = supportsSoft && mainIndex >= 0 && mainIndex < lights.Length && lights[mainIndex].light && lights[mainIndex].light.shadows == LightShadows.Soft;
@@ -456,6 +587,7 @@ namespace FailCake
                 VisibleLight visibleLight = lights[i];
                 Light light = visibleLight.light;
                 if (!light) continue;
+
                 if (visibleLight.lightType != LightType.Spot && visibleLight.lightType != LightType.Point) continue;
 
                 bool isPoint = visibleLight.lightType == LightType.Point;
@@ -464,6 +596,7 @@ namespace FailCake
 
                 if (light.shadows == LightShadows.None || light.shadowStrength <= 0f) continue;
                 if (soft) this._softThisFrame = true;
+                if (!shadowIndices.IsCreated || i >= shadowIndices.Length || shadowIndices[i] < 0) continue;
 
                 Vector3 lightPos = visibleLight.localToWorldMatrix.GetColumn(3);
                 float fadeDistance = maxShadowDistance + light.range;
@@ -476,10 +609,25 @@ namespace FailCake
                     paramIndex = paramIndex - 1,
                     lightId = lightId,
                     isPoint = isPoint,
-                    sliceCount = isPoint ? 6 : 1
+                    sliceCount = isPoint ? 6 : 1,
+                    priority = shadowIndices[i],
+                    lastUpdateFrame = this._feature.maxStaticSlicesPerFrame > 0 && this._slots.TryGetValue(lightId, out CachedShadowSlot slot) ? slot.lastUpdateFrame : -1
                 });
 
                 this._visibleIds.Add(lightId);
+            }
+
+            for (int i = 1; i < this._visible.Count; i++)
+            {
+                VisibleLightInfo info = this._visible[i];
+                int j = i - 1;
+                while (j >= 0 && (this._visible[j].lastUpdateFrame > info.lastUpdateFrame || (this._visible[j].lastUpdateFrame == info.lastUpdateFrame && this._visible[j].priority > info.priority)))
+                {
+                    this._visible[j + 1] = this._visible[j];
+                    j--;
+                }
+
+                this._visible[j + 1] = info;
             }
         }
 
@@ -488,34 +636,26 @@ namespace FailCake
             this._copySliceEntries.Clear();
             this._dynamicSliceEntries.Clear();
 
-            long cacheUpdateGeneration = CachedShadowFeature.GetCacheUpdateGeneration();
-            if (this._cacheUpdateGeneration != cacheUpdateGeneration)
+            if (this._lastBudgetFrameId != CachedShadowFeature.FRAME_ID)
             {
-                this._cacheUpdateGeneration = cacheUpdateGeneration;
-                foreach (KeyValuePair<EntityId, LightSlot> pair in this._slots) pair.Value.dirtyStatic = true;
+                this._lastBudgetFrameId = CachedShadowFeature.FRAME_ID;
+                this._remainingStaticSlices = this._feature.maxStaticSlicesPerFrame > 0 ? Mathf.Max(6, this._feature.maxStaticSlicesPerFrame) : int.MaxValue;
             }
 
             int frame = Time.frameCount;
+            bool useRenderingLayers = UniversalRenderPipeline.asset && UniversalRenderPipeline.asset.useRenderingLayers;
 
             for (int v = 0; v < this._visible.Count; v++)
             {
                 VisibleLightInfo info = this._visible[v];
                 VisibleLight visibleLight = lightData.visibleLights[info.visibleIndex];
+
                 Light light = visibleLight.light;
                 if (!light) continue;
 
-                bool hasShadowCasters = renderingData.cullResults.GetShadowCasterBounds(info.visibleIndex, out Bounds _);
-                bool casterCullChanged = light.useViewFrustumForShadowCasterCull;
-                if (casterCullChanged)
-                {
-                    this._modifiedCullLights.Add(light);
-                    light.useViewFrustumForShadowCasterCull = false;
-                }
-
                 int blockDim = this.BlockDimFor(shadowData, info.visibleIndex);
-                bool shadowRequested = CachedShadowFeature.ConsumeShadowRequest(info.lightId);
 
-                if (this._slots.TryGetValue(info.lightId, out LightSlot slot) && shadowRequested && (slot.sliceCount != info.sliceCount || slot.blockDim != blockDim))
+                if (this._slots.TryGetValue(info.lightId, out CachedShadowSlot slot) && (slot.sliceCount != info.sliceCount || slot.blockDim != blockDim))
                 {
                     this.FreeSlot(slot);
                     slot = null;
@@ -529,14 +669,39 @@ namespace FailCake
 
                 slot.lastSeenFrame = frame;
 
-                for (int s = 0; s < slot.sliceCount; s++) this._entryVisibleIndex[slot.firstEntry + s] = info.visibleIndex;
+                bool casterCullChanged = light.useViewFrustumForShadowCasterCull;
+                if (casterCullChanged)
+                {
+                    this._modifiedCullLights.Add(light);
+                    light.useViewFrustumForShadowCasterCull = false;
+                    slot.dirtyStatic = true;
+                }
 
-                if (shadowRequested) slot.dirtyStatic = true;
+                for (int s = 0; s < slot.sliceCount; s++)
+                {
+                    this._entryVisibleIndex[slot.firstEntry + s] = info.visibleIndex;
+                    this._entryFace[slot.firstEntry + s] = s;
+                }
 
-                if (slot.dirtyStatic && hasShadowCasters && !casterCullChanged && this.PrepareSliceRender(slot, ref visibleLight, light, ref renderingData.cullResults, shadowData, info.visibleIndex))
+                long generation = CachedShadowFeature.GetShadowGeneration(info.lightId);
+                ulong contentHash = CachedShadowPass.GetLightHash(ref visibleLight, light, shadowData, info.visibleIndex, this._shadowParams[info.paramIndex].y);
+                if (slot.contentHash != contentHash || slot.refreshGeneration != generation) slot.dirtyStatic = true;
+                bool hasShadowCasters = renderingData.cullResults.GetShadowCasterBounds(info.visibleIndex, out Bounds _);
+                if (!hasShadowCasters)
+                {
+                    slot.dirtyStatic = true;
+                    continue;
+                }
+
+                if (slot.dirtyStatic && !casterCullChanged && this._remainingStaticSlices >= slot.sliceCount && this.PrepareSliceRender(slot, ref visibleLight, light, ref renderingData.cullResults, shadowData, info.visibleIndex))
                 {
                     slot.dirtyStatic = false;
                     slot.hasRenderedOnce = true;
+                    slot.contentHash = contentHash;
+                    slot.refreshGeneration = generation;
+                    slot.lastUpdateFrame = frame;
+                    slot.compositeDirty = true;
+                    this._remainingStaticSlices -= slot.sliceCount;
 
                     for (int s = 0; s < slot.sliceCount; s++)
                     {
@@ -545,18 +710,46 @@ namespace FailCake
                     }
                 }
 
-            if (!slot.hasRenderedOnce) continue;
-
-            this._shadowParams[info.paramIndex].z = slot.isPoint ? CachedShadowPass.LIGHT_TYPE_POINT : CachedShadowPass.LIGHT_TYPE_SPOT;
-            this._shadowParams[info.paramIndex].w = slot.firstEntry;
-            for (int s = 0; s < slot.sliceCount; s++)
-            {
-                int entry = slot.firstEntry + s;
-
-                this._copySliceEntries.Add(entry);
-                if (hasShadowCasters && light.intensity > 0f) this._dynamicSliceEntries.Add(entry);
+                if (!slot.hasRenderedOnce || slot.dirtyStatic) continue;
+                this._shadowParams[info.paramIndex].w = slot.firstEntry;
+                int dynamicMask = 0;
+                if (light.intensity > 0f)
+                    dynamicMask = slot.isPoint && this._feature.cullDynamicPointFaces
+                        ? this._dynamicCasters.GetPointFaceMask(this._entryLightPos[slot.firstEntry], visibleLight.range, light.cullingMask, unchecked((uint)light.renderingLayerMask), useRenderingLayers, this._entryProj[slot.firstEntry].m00,
+                            this._entryBias[slot.firstEntry].x)
+                        : (1 << slot.sliceCount) - 1;
+                this.PrepareComposite(slot, dynamicMask);
             }
         }
+
+        private void UpdateDynamicCasters() {
+            if (!this._feature.cullDynamicPointFaces)
+            {
+                this._dynamicCasters?.Dispose();
+                this._dynamicCasters = null;
+                return;
+            }
+
+            for (int i = 0; i < this._visible.Count; i++)
+            {
+                if (!this._visible[i].isPoint) continue;
+                this._dynamicCasters ??= new CachedShadowCasters();
+                this._dynamicCasters.Update();
+                return;
+            }
+        }
+
+        private void PrepareComposite(CachedShadowSlot slot, int dynamicMask) {
+            int restoreMask = slot.compositeDirty ? (1 << slot.sliceCount) - 1 : slot.dynamicFaceMask | dynamicMask;
+            for (int face = 0; face < slot.sliceCount; face++)
+            {
+                int entry = slot.firstEntry + face;
+                if ((restoreMask & (1 << face)) != 0) this._copySliceEntries.Add(entry);
+                if ((dynamicMask & (1 << face)) != 0) this._dynamicSliceEntries.Add(entry);
+            }
+
+            slot.dynamicFaceMask = dynamicMask;
+            slot.compositeDirty = false;
         }
 
         private int BlockDimFor(UniversalShadowData shadowData, int visibleIndex) {
@@ -567,13 +760,14 @@ namespace FailCake
             return Mathf.Clamp(resolution / this._cellRes, 1, Mathf.Max(1, Mathf.Min(this._gridX, this._gridY)));
         }
 
-        private bool PrepareSliceRender(LightSlot slot, ref VisibleLight visibleLight, Light light, ref CullingResults cullResults, UniversalShadowData shadowData, int visibleIndex) {
+        private bool PrepareSliceRender(CachedShadowSlot slot, ref VisibleLight visibleLight, Light light, ref CullingResults cullResults, UniversalShadowData shadowData, int visibleIndex) {
             bool soft = light.shadows == LightShadows.Soft;
             int tileRes = slot.blockDim * this._cellRes;
 
             float invW = 1f / this._atlasW;
             float invH = 1f / this._atlasH;
             float fovBias = slot.isPoint ? CachedShadowPass.PointLightFovBias(tileRes, soft) : 0f;
+            Vector4 bias = Vector4.zero;
 
             for (int s = 0; s < slot.sliceCount; s++)
             {
@@ -584,6 +778,7 @@ namespace FailCake
                     : ShadowUtils.ExtractSpotLightMatrix(ref cullResults, shadowData, visibleIndex, out shadowMatrix, out view, out proj, out ShadowSplitData _);
 
                 if (!ok) return false;
+                if (s == 0) bias = ShadowUtils.GetShadowBias(ref visibleLight, visibleIndex, shadowData, proj, tileRes);
 
                 Matrix4x4 sliceTransform = Matrix4x4.identity;
                 sliceTransform.m00 = tileRes * invW;
@@ -595,7 +790,7 @@ namespace FailCake
                     view = view,
                     proj = proj,
                     worldToShadow = sliceTransform * shadowMatrix,
-                    bias = ShadowUtils.GetShadowBias(ref visibleLight, visibleIndex, shadowData, proj, tileRes)
+                    bias = bias
                 };
             }
 
@@ -619,7 +814,8 @@ namespace FailCake
             return true;
         }
 
-        private LightSlot AllocSlot(EntityId lightId, int sliceCount, int blockDim, bool isPoint, int frame) {
+        private CachedShadowSlot AllocSlot(EntityId lightId, int sliceCount, int blockDim, bool isPoint, int frame) {
+            if (sliceCount > this._maxSlices || (long)sliceCount * blockDim * blockDim > this._cellUsed.Length) return null;
             while (true)
             {
                 int firstEntry = this.AllocEntryRun(sliceCount);
@@ -643,7 +839,7 @@ namespace FailCake
 
                     if (blocksOk)
                     {
-                        LightSlot slot = new LightSlot {
+                        CachedShadowSlot slot = new CachedShadowSlot {
                             lightId = lightId,
                             firstEntry = firstEntry,
                             sliceCount = sliceCount,
@@ -670,7 +866,7 @@ namespace FailCake
             }
         }
 
-        private void FreeSlot(LightSlot slot) {
+        private void FreeSlot(CachedShadowSlot slot) {
             for (int s = 0; s < slot.sliceCount; s++)
             {
                 int entry = slot.firstEntry + s;
@@ -683,23 +879,21 @@ namespace FailCake
         }
 
         private int AllocEntryRun(int sliceCount) {
-            if (this._freeEntryRuns.TryGetValue(sliceCount, out Stack<int> pool) && pool.Count > 0) return pool.Pop();
-            if (this._nextFreeEntry + sliceCount > this._maxSlices) return -1;
+            int runLength = 0;
+            for (int i = 0; i < this._entryUsed.Length; i++)
+            {
+                runLength = this._entryUsed[i] ? 0 : runLength + 1;
+                if (runLength < sliceCount) continue;
+                int firstEntry = i - sliceCount + 1;
+                for (int s = 0; s < sliceCount; s++) this._entryUsed[firstEntry + s] = true;
+                return firstEntry;
+            }
 
-            int firstEntry = this._nextFreeEntry;
-            this._nextFreeEntry += sliceCount;
-
-            return firstEntry;
+            return -1;
         }
 
         private void FreeEntryRun(int firstEntry, int sliceCount) {
-            if (!this._freeEntryRuns.TryGetValue(sliceCount, out Stack<int> pool))
-            {
-                pool = new Stack<int>();
-                this._freeEntryRuns.Add(sliceCount, pool);
-            }
-
-            pool.Push(firstEntry);
+            for (int s = 0; s < sliceCount; s++) this._entryUsed[firstEntry + s] = false;
         }
 
         private bool AllocBlock(int blockDim, out int blockX, out int blockY) {
@@ -746,12 +940,12 @@ namespace FailCake
         }
 
         private bool EvictOne(EntityId excludeId) {
-            LightSlot victim = null;
-            LightSlot oldestRendered = null;
+            CachedShadowSlot victim = null;
+            CachedShadowSlot oldestRendered = null;
 
-            foreach (KeyValuePair<EntityId, LightSlot> pair in this._slots)
+            foreach (KeyValuePair<EntityId, CachedShadowSlot> pair in this._slots)
             {
-                LightSlot candidate = pair.Value;
+                CachedShadowSlot candidate = pair.Value;
                 if (candidate.lightId == excludeId) continue;
                 if (this._visibleIds.Contains(candidate.lightId)) continue;
 
@@ -773,7 +967,7 @@ namespace FailCake
         }
 
         private void CreateRendererLists(RenderGraph renderGraph, UniversalRenderingData renderingData) {
-            bool useLayers = UniversalRenderPipeline.asset != null && UniversalRenderPipeline.asset.useRenderingLayers;
+            bool useLayers = UniversalRenderPipeline.asset && UniversalRenderPipeline.asset.useRenderingLayers;
 
             this.FillLists(renderGraph, renderingData, this._staticSliceEntries, this._staticLists, ShadowObjectsFilter.StaticOnly, useLayers);
             this.FillLists(renderGraph, renderingData, this._dynamicSliceEntries, this._dynamicLists, ShadowObjectsFilter.DynamicOnly, useLayers);
@@ -787,7 +981,8 @@ namespace FailCake
                 int entry = entries[i];
                 ShadowDrawingSettings settings = new ShadowDrawingSettings(renderingData.cullResults, this._entryVisibleIndex[entry]) {
                     useRenderingLayerMaskTest = useLayers,
-                    objectsFilter = objectsFilter
+                    objectsFilter = objectsFilter,
+                    splitIndex = this._entryFace[entry]
                 };
 
                 lists.Add(renderGraph.CreateShadowRendererList(ref settings));
@@ -829,11 +1024,26 @@ namespace FailCake
             cmd.DrawProcedural(Matrix4x4.identity, this._blitMaterial, CachedShadowPass.PASS_CLEAR, MeshTopology.Triangles, 3);
         }
 
-        private void CopyTile(RasterCommandBuffer cmd, TextureHandle source, int entry) {
-            cmd.SetViewport(new Rect(this._entryBlockX[entry] * this._cellRes, this._entryBlockY[entry] * this._cellRes, this._entryBlockRes[entry], this._entryBlockRes[entry]));
+        private void CopyTiles(RasterCommandBuffer cmd, TextureHandle source, List<int> entries) {
+            if (entries.Count == 0) return;
+            cmd.DisableScissorRect();
+            cmd.SetGlobalDepthBias(0f, 0f);
+            cmd.SetViewport(new Rect(0f, 0f, this._atlasW, this._atlasH));
             cmd.SetViewProjectionMatrices(Matrix4x4.identity, Matrix4x4.identity);
             cmd.SetGlobalTexture(CachedShadowPass.ID_COPY_SOURCE, source);
-            cmd.DrawProcedural(Matrix4x4.identity, this._blitMaterial, CachedShadowPass.PASS_COPY, MeshTopology.Triangles, 3);
+            cmd.SetGlobalVector(CachedShadowPass.ID_COPY_ATLAS_SIZE, new Vector4(1f / this._atlasW, 1f / this._atlasH, 0f, 0f));
+            for (int start = 0; start < entries.Count; start += CachedShadowPass.MAX_COPY_TILES)
+            {
+                int count = Mathf.Min(CachedShadowPass.MAX_COPY_TILES, entries.Count - start);
+                for (int i = 0; i < count; i++)
+                {
+                    int entry = entries[start + i];
+                    this._copyTiles[i] = new Vector4(this._entryBlockX[entry] * this._cellRes, this._entryBlockY[entry] * this._cellRes, this._entryBlockRes[entry], this._entryBlockRes[entry]);
+                }
+
+                cmd.SetGlobalVectorArray(CachedShadowPass.ID_COPY_TILES, this._copyTiles);
+                cmd.DrawProcedural(Matrix4x4.identity, this._blitMaterial, CachedShadowPass.PASS_COPY, MeshTopology.Triangles, count * 6);
+            }
         }
 
         private void SetupReceiverConstants(RasterCommandBuffer cmd, float maxShadowDistanceSq, float cascadeBorder, bool softShadows) {
@@ -856,63 +1066,19 @@ namespace FailCake
             }
         }
 
-        private static void ExecuteStaticBake(StaticPassData data, RasterGraphContext ctx) {
-            RasterCommandBuffer cmd = ctx.cmd;
-            CachedShadowPass pass = data.pass;
-
-            cmd.SetKeyword(CachedShadowPass.K_CASTING_PUNCTUAL_LIGHT_SHADOW, true);
-
-            for (int i = 0; i < data.sliceEntries.Count; i++)
-            {
-                int entry = data.sliceEntries[i];
-
-                pass.SetupSliceGlobals(cmd, entry);
-                pass.ClearTile(cmd, entry);
-
-                RendererList rendererList = data.lists[i];
-                pass.RenderSlice(cmd, entry, rendererList);
-            }
-
-            CachedShadowPass.RestoreCameraViewProjection(cmd, data.cameraData);
-        }
-
-        private static void ExecuteMain(MainPassData data, RasterGraphContext ctx) {
-            RasterCommandBuffer cmd = ctx.cmd;
-            CachedShadowPass pass = data.pass;
-
-            if (data.copyEntries.Count > 0 || data.dynamicEntries.Count > 0)
-            {
-                cmd.SetKeyword(CachedShadowPass.K_CASTING_PUNCTUAL_LIGHT_SHADOW, true);
-
-                for (int i = 0; i < data.copyEntries.Count; i++) pass.CopyTile(cmd, data.staticTexture, data.copyEntries[i]);
-
-                for (int i = 0; i < data.dynamicEntries.Count; i++)
-                {
-                    int entry = data.dynamicEntries[i];
-
-                    pass.SetupSliceGlobals(cmd, entry);
-
-                    RendererList rendererList = data.dynamicLists[i];
-                    pass.RenderSlice(cmd, entry, rendererList);
-                }
-            }
-
-            CachedShadowPass.SetShadowKeywordState(data.shadowData, data.softShadows);
-            cmd.SetKeyword(CachedShadowPass.K_ADDITIONAL_LIGHT_SHADOWS, true);
-            CachedShadowPass.SetSoftShadowKeywords(cmd, data.softShadows);
-            pass.SetupReceiverConstants(cmd, data.maxShadowDistanceSq, data.cascadeBorder, data.softShadows);
-            CachedShadowPass.RestoreCameraViewProjection(cmd, data.cameraData);
-        }
-
         #endregion
 
         private struct VisibleLightInfo
         {
             public int visibleIndex;
             public int paramIndex;
+
             public EntityId lightId;
             public bool isPoint;
+
             public int sliceCount;
+            public int priority;
+            public int lastUpdateFrame;
         }
 
         private struct PreparedSlice
@@ -920,41 +1086,8 @@ namespace FailCake
             public Matrix4x4 view;
             public Matrix4x4 proj;
             public Matrix4x4 worldToShadow;
+
             public Vector4 bias;
-        }
-
-        private class LightSlot
-        {
-            public EntityId lightId;
-            public int firstEntry;
-            public int sliceCount;
-            public int blockDim;
-            public bool isPoint;
-            public bool dirtyStatic;
-            public bool hasRenderedOnce;
-            public int lastSeenFrame;
-        }
-
-        private class StaticPassData
-        {
-            public CachedShadowPass pass;
-            public UniversalCameraData cameraData;
-            public List<int> sliceEntries;
-            public List<RendererListHandle> lists;
-        }
-
-        private class MainPassData
-        {
-            public CachedShadowPass pass;
-            public UniversalCameraData cameraData;
-            public UniversalShadowData shadowData;
-            public TextureHandle staticTexture;
-            public List<int> copyEntries;
-            public List<int> dynamicEntries;
-            public List<RendererListHandle> dynamicLists;
-            public float maxShadowDistanceSq;
-            public float cascadeBorder;
-            public bool softShadows;
         }
     }
 }
