@@ -14,11 +14,10 @@
 </h4>
 
 Shadow caching for URP spot & point lights
-
 Needs Unity 6 (URP 17+), RenderGraph, Forward / Forward+
 
 ## Installation
-<img width="256" height="256" src="https://github.com/user-attachments/assets/5d3fcc53-d3b5-4938-94b6-9974f772c646" />
+<img width="256" src="https://github.com/user-attachments/assets/5d3fcc53-d3b5-4938-94b6-9974f772c646" />
 
 Package Manager > Add Git URL:
 ```
